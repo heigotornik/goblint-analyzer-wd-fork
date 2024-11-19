@@ -63,7 +63,10 @@ module Base =
       var_messages: Message.t HM.t; (** Messages from right-hand sides of variables. Used for incremental postsolving. *)
       rho_write: S.Dom.t HM.t HM.t; (** Side effects from variables to write-only variables with values. Used for fast incremental restarting of write-only variables. *)
       dep: VS.t HM.t; (** Dependencies of variables. Inverse of [infl]. Used for fast pre-reachable pruning in incremental postsolving. *)
+      tmp_dep: VS.t HM.t; (** Dependencies of variables. Inverse of [infl]. Used for fast pre-reachable pruning in incremental postsolving. *)
       weak_dep: VS.t HM.t; (** Map of weak dependencies. "caller" -> "end of function" **)
+      th_infl: VS.t HM.t;
+      abort: unit HM.t; 
     }
 
     type marshal = solver_data
@@ -81,6 +84,9 @@ module Base =
       rho_write = HM.create 10;
       dep = HM.create 10;
       weak_dep = HM.create 10;
+      th_infl = HM.create 10;
+      abort = HM.create 10;
+      tmp_dep = HM.create 10;
     }
 
     let print_data data =
@@ -127,7 +133,10 @@ module Base =
         var_messages = HM.copy data.var_messages;
         rho_write = HM.map (fun x w -> HM.copy w) data.rho_write; (* map copies outer HM *)
         dep = HM.copy data.dep;
+        tmp_dep = HM.copy data.dep;
         weak_dep = HM.copy data.weak_dep;
+        th_infl = HM.copy data.th_infl;
+        abort = HM.copy data.abort;
       }
 
     (* The following hack is for fixing hashconsing.
@@ -192,12 +201,24 @@ module Base =
       HM.iter (fun k v ->
           HM.replace dep (S.Var.relift k) (VS.map S.Var.relift v)
         ) data.dep;
+      let tmp_dep = HM.create (HM.length data.tmp_dep) in
+        HM.iter (fun k v ->
+            HM.replace tmp_dep (S.Var.relift k) (VS.map S.Var.relift v)
+          ) data.tmp_dep;
       let weak_dep = HM.create (HM.length data.weak_dep) in
       HM.iter (fun k v ->
           HM.replace weak_dep (S.Var.relift k) (VS.map S.Var.relift v)
         ) data.weak_dep;
-      
-      {st; infl; sides; rho; wpoint; stable; side_dep; side_infl; var_messages; rho_write; dep; weak_dep}
+      let th_infl = HM.create (HM.length data.th_infl) in
+      HM.iter (fun k v ->
+          HM.replace th_infl (S.Var.relift k) (VS.map S.Var.relift v)
+        ) data.th_infl;
+      let abort = HM.create (HM.length data.abort) in
+      HM.iter (fun k v ->
+          HM.replace abort (S.Var.relift k) v
+        ) data.abort;
+      let wpoint = HM.create (HM.length data.wpoint) in
+      {st; infl; sides; rho; wpoint; stable; side_dep; side_infl; var_messages; rho_write; dep; tmp_dep; weak_dep; th_infl; abort}
 
     type phase = Widen | Narrow [@@deriving show] (* used in inner solve *)
 
@@ -261,6 +282,9 @@ module Base =
       let rho_write = data.rho_write in
       let dep = data.dep in
       let weak_dep = data.weak_dep in
+      let th_infl = data.th_infl in
+      let abort = data.abort in
+      let tmp_dep = data.tmp_dep in
 
       let () = print_solver_stats := fun () ->
           print_data data;
@@ -281,7 +305,23 @@ module Base =
         HM.replace dep x (VS.add y (HM.find_default dep x VS.empty));
       in
       let add_sides y x = HM.replace sides y (VS.add x (try HM.find sides y with Not_found -> VS.empty)) in
-
+      let non_abortive x in_thread =
+        if in_thread then true else (
+          (* TODO: how could we get the dep key that contains x without iterating through everything*)
+          if (HM.is_empty th_infl) then true else (
+            HM.exists (fun infl_k th_infl_v -> (
+              HM.exists (fun dep_k dep_v -> (
+                VS.exists (fun value -> (
+                  if (VS.mem x dep_v) && (VS.mem value dep_v) then (
+                    HM.replace abort x ();
+                    true
+                  ) else false
+                )) th_infl_v;
+              )) tmp_dep;
+            )) th_infl
+          )
+        )
+      in
       let destabilize_ref: (S.v -> unit) ref = ref (fun _ -> failwith "no destabilize yet") in
       let destabilize x = !destabilize_ref x in (* must be eta-expanded to use changed destabilize_ref *)
 
@@ -300,12 +340,20 @@ module Base =
             else
               true
           ) w false
-      and solve ?reuse_eq x phase =
+
+      and solve ?reuse_eq x phase in_thread =
         if tracing then trace "sol2" "solve %a, phase: %s, called: %b, stable: %b, wpoint: %b" S.Var.pretty_trace x (show_phase phase) (HM.mem called x) (HM.mem stable x) (HM.mem wpoint x);
         init x;
         assert (Hooks.system x <> None);
-        if not (HM.mem called x || HM.mem stable x) then (
+        if in_thread then (
+          HM.replace th_infl x (try HM.find dep x with Not_found -> VS.empty);
+        ) else (
+            if tracing then trace "sol2" "is non abortive %b" (non_abortive x in_thread);
+        );
+        if not (HM.mem called x || HM.mem stable x  ) then (
           if tracing then trace "sol2" "stable add %a" S.Var.pretty_trace x;
+        
+          
           HM.replace stable x ();
           HM.replace called x ();
           (* Here we cache HM.mem wpoint x before eq. If during eq eval makes x wpoint, then be still don't apply widening the first time, but just overwrite.
@@ -324,8 +372,9 @@ module Base =
               d
             | _ ->
               (* The RHS is re-evaluated, all deps are re-trigerred *)
+            
               HM.replace dep x VS.empty;
-              eq x (eval l x) (side ~x) (demand_thr x)
+              eq x (eval in_thread (not (non_abortive x in_thread)) l x) (side ~x) (demand_thr x)
           in
           HM.remove called x;
           let old = HM.find rho x in (* d from older solve *) (* find old value after eq since wpoint restarting in eq/eval might have changed it meanwhile *)
@@ -353,12 +402,12 @@ module Base =
             update_var_event x old wpd;
             HM.replace rho x wpd;
             destabilize x;
-            (solve[@tailcall]) x phase
+            (solve[@tailcall]) x phase in_thread
           ) else (
             (* TODO: why non-equal and non-stable checks in switched order compared to TD3 paper? *)
             if not (HM.mem stable x) then ( (* value unchanged, but not stable, i.e. destabilized itself during rhs *)
               if tracing then trace "sol2" "solve still unstable %a" S.Var.pretty_trace x;
-              (solve[@tailcall]) x Widen
+              (solve[@tailcall]) x Widen in_thread
             ) else (
               if term && phase = Widen && HM.mem wpoint x then ( (* TODO: or use wp? *)
                 if tracing then trace "sol2" "solve switching to narrow %a" S.Var.pretty_trace x;
@@ -366,7 +415,7 @@ module Base =
                 HM.remove stable x;
                 HM.remove superstable x;
                 Hooks.stable_remove x;
-                (solve[@tailcall]) ~reuse_eq:eqd x Narrow
+                (solve[@tailcall]) ~reuse_eq:eqd x Narrow in_thread
               ) else if remove_wpoint && not space && (not term || phase = Narrow) then ( (* this makes e.g. nested loops precise, ex. tests/regression/34-localization/01-nested.c - if we do not remove wpoint, the inner loop head will stay a wpoint and widen the outer loop variable. *)
                 if tracing then trace "sol2" "solve removing wpoint %a (%b)" S.Var.pretty_trace x (HM.mem wpoint x);
                 HM.remove wpoint x
@@ -379,29 +428,30 @@ module Base =
         match Hooks.system x with
         | None -> S.Dom.bot ()
         | Some f -> f get set demand
-      and simple_solve l x y =
+      and simple_solve l x y in_thread should_abort =
         if tracing then trace "sol2" "simple_solve %a (rhs: %b)" S.Var.pretty_trace y (Hooks.system y <> None);
         if Hooks.system y = None then (init y; HM.replace stable y (); HM.find rho y) else
-        if not space || HM.mem wpoint y then (solve y Widen; HM.find rho y) else
+        if not space || HM.mem wpoint y then (solve y Widen in_thread; HM.find rho y) else
         if HM.mem called y then (init y; HM.remove l y; HM.find rho y) else (* TODO: [HM.mem called y] is not in the TD3 paper, what is it for? optimization? *)
         (* if HM.mem called y then (init y; let y' = HM.find_default l y (S.Dom.bot ()) in HM.replace rho y y'; HM.remove l y; y') else *)
         if cache && HM.mem l y then HM.find l y
         else (
           HM.replace called y ();
-          let eqd = eq y (eval l x) (side ~x) (demand_thr x) in
+          let eqd = eq y (eval in_thread false l x) (side ~x) (demand_thr x) in
           HM.remove called y;
-          if HM.mem wpoint y then (HM.remove l y; solve y Widen; HM.find rho y)
+          if HM.mem wpoint y then (HM.remove l y; solve y Widen in_thread; HM.find rho y)
           else (if cache then HM.replace l y eqd; eqd)
         )
+
       and demand_thr x y =
         if tracing then trace "sol2" "demand weak dep %a from %a" S.Var.pretty_trace y S.Var.pretty_trace x;
         HM.replace weak_dep x (VS.add y (try HM.find weak_dep x with Not_found -> VS.empty));
         (* TODO: should we check if it is already added? and solve if it is not*)
         if eager_solve_wk_deps then (
-          solve y Widen;
+          solve y Widen true;
         );
         
-      and eval l x y =
+      and eval in_thread should_abort l x y =
         if tracing then trace "sol2" "eval %a ## %a" S.Var.pretty_trace x S.Var.pretty_trace y;
         get_var_event y;
         if HM.mem called y then (
@@ -419,7 +469,7 @@ module Base =
           if tracing then trace "sol2" "eval adding wpoint %a from %a" S.Var.pretty_trace y S.Var.pretty_trace x;
           HM.replace wpoint y ();
         );
-        let tmp = simple_solve l x y in
+        let tmp = simple_solve l x y in_thread should_abort in
         if HM.mem rho y then add_infl y x;
         if tracing then trace "sol2" "eval %a ## %a -> %a" S.Var.pretty_trace x S.Var.pretty_trace y S.Dom.pretty tmp;
         tmp
@@ -782,7 +832,7 @@ module Base =
           HM.iter (fun x (old_rho, old_infl) -> HM.replace rho x old_rho; HM.replace infl x old_infl) old_ret;
           HM.iter (fun x (old_rho, old_infl) ->
               Logs.debug "test for %a" Node.pretty_trace (S.Var.node x);
-              solve x Widen;
+              solve x Widen false;
               if not (S.Dom.equal (HM.find rho x) old_rho) then (
                 Logs.debug "Further destabilization happened ...";
               )
@@ -808,15 +858,59 @@ module Base =
         let to_list (acc: S.v list ) (v: VS.t) = VS.fold (fun el acc -> el :: acc) v acc in
         let hm_keys (hm: VS.t HM.t) = HM.fold (fun k v acc -> to_list acc v) hm [] in
         let unstable_wk_dps = List.filter (neg (HM.mem stable)) (hm_keys weak_dep)  in
-        if List.length unstable_wk_dps = 0 then (
+        if List.length unstable_wk_dps == 0 then (
           if tracing then trace "sol2" "unstable_wk_deps is empty";
         ) else (
           if tracing then trace "sol2" "unstable_wk_deps length %i" (List.length unstable_wk_dps);
         );
 
-        let interesting_vs = List.append (List.append List.([]) unstable_wk_dps ) vs in
-        let unstable_vs = List.filter (neg (HM.mem stable)) (interesting_vs) in
-        if unstable_vs <> [] then (
+        let run_trace map desc = (
+        if tracing then (
+          trace "sol2" "--------------------------------";
+          HM.iter (fun k v -> (
+          if neg VS.is_empty v then (
+                
+                trace "sol2" "%s key: %a" desc  S.Var.pretty_trace k;
+                  VS.iter (fun sv -> (
+                    trace "sol2" "%s value: %a" desc  S.Var.pretty_trace sv;
+                  )) v;
+                  trace "sol2" "" ;
+                );
+              )) map;
+              trace "sol2" "--------------------------------";
+            );
+          ) in
+          let run_trace2 map desc = (
+            if tracing then (
+              trace "sol2" "--------------------------------";
+              HM.iter (fun k v -> (
+                trace "sol2" "%s value: %a" desc  S.Var.pretty_trace k;
+              
+                trace "sol2" "";
+
+              )) map;
+              trace "sol2" "--------------------------------";
+            )
+          ) in
+            
+        run_trace weak_dep "weak_dep";
+        run_trace infl "infl";
+        run_trace sides "sides";
+        run_trace dep "dep";
+        run_trace side_dep "rho";
+        run_trace side_infl "side_infl";
+        run_trace th_infl "th_infl";
+        run_trace2 abort "non-aborting";
+
+        HM.iter (fun k v -> (
+          trace "sol2" " stable: %a" S.Var.pretty_trace k;
+        )) stable;
+        List.iter (fun v -> (
+          trace "sol2" " vs: %a" S.Var.pretty_trace v;
+        ))vs;
+        let unstable_vs = List.filter (neg (HM.mem stable)) vs in
+        let interesting_vs = List.append (List.append List.([]) unstable_wk_dps ) unstable_vs in
+        if interesting_vs <> [] then (
           if Logs.Level.should_log Debug then (
             if !i = 1 then Logs.newline ();
             Logs.debug "Unstable solver start vars in %d. phase:" !i;
@@ -824,7 +918,28 @@ module Base =
             Logs.newline ();
             flush_all ();
           );
-          List.iter (fun x -> solve x Widen) unstable_vs;
+
+          List.iter (fun x -> solve x Widen true) unstable_wk_dps;
+          HM.clear tmp_dep;
+          HM.iter (
+            fun k v -> (
+              HM.replace tmp_dep k v;
+            )
+          ) dep;
+          let reeval = List.map (fun (k,v) -> k) (HM.to_list infl) in
+
+          List.iter (fun x -> (
+            if (  not (HM.mem stable x)) then (
+              trace "sol2" "checking %a" S.Var.pretty_trace x;
+
+            );
+            if (  not (HM.mem stable x) && non_abortive x false) then (
+              trace "sol2" "non_abortive %a" S.Var.pretty_trace x;
+              solve x Widen false;
+            )
+          )) reeval;
+          
+          List.iter (fun x -> solve x Widen false) unstable_vs;
           solver ();
         )
       in
@@ -1075,7 +1190,7 @@ module Base =
       print_data_verbose data "Data after postsolve";
 
       verify_data data;
-      (rho, {st; infl; sides; rho; wpoint; stable; side_dep; side_infl; var_messages; rho_write; dep; weak_dep})
+      (rho, {st; infl; sides; rho; wpoint; stable; side_dep; side_infl; var_messages; rho_write; dep; tmp_dep; weak_dep; th_infl; abort})
   end
 
 (** TD3 with no hooks. *)
