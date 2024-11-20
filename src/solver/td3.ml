@@ -926,17 +926,13 @@ module Base =
               HM.replace tmp_dep k v;
             )
           ) dep;
-          let reeval = List.map (fun (k,v) -> k) (HM.to_list infl) in
-
+          let reeval = List.rev (List.filter (fun x -> not (HM.mem stable x) && non_abortive x false) (List.map (fun (k,v) -> k) (HM.to_list infl))) in
           List.iter (fun x -> (
-            if (  not (HM.mem stable x)) then (
-              trace "sol2" "checking %a" S.Var.pretty_trace x;
-
-            );
-            if (  not (HM.mem stable x) && non_abortive x false) then (
+            trace "sol2" "in reeval %a" S.Var.pretty_trace x;
+          )) reeval;
+          List.iter (fun x -> (
               trace "sol2" "non_abortive %a" S.Var.pretty_trace x;
               solve x Widen false;
-            )
           )) reeval;
           
           List.iter (fun x -> solve x Widen false) unstable_vs;
